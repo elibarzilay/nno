@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+
+# ----------------------------------------------------------------------
+
+# >>> Customization variables can be set here
+
+# ----------------------------------------------------------------------
+
+HOST="${N_HOST-nodejs.org}"
+DDIR="download"
+DSEC="release" # $version can have a different "sec/" prefix
+PREFIX="/usr/local"
+MYNAME="$(basename "$0")"
+
+# Note: for the main downloads,
+#   "https://$HOST/dist/" is the same as "https://$HOST/download/release/"
+
+# ----------------------------------------------------------------------
+set -eu
+die() { printf "%s\n" "$@" 1>&2; exit 1; }
+
+# ----------------------------------------------------------------------
+
+if [[ "${N_AUTO_SUDO-}" = yes && "$(id -u)" != 0 ]]; then
+  exec sudo "$0" "$@"
+fi
+
+# ----------------------------------------------------------------------
+INFODIR="$PREFIX/$MYNAME-info"
+NOTEFILE="$INFODIR/vers"
+if [[ ! -d "$INFODIR" ]]; then mkdir "$INFODIR"; fi
+
+# ----------------------------------------------------------------------
+help() {
+  local me="$MYNAME"
+  echo "$MYNAME <ver>    -- install a version"
+  echo "$MYNAME ls <ver> -- list all versions"
+  exit
+}
+
+# ----------------------------------------------------------------------
+set_os_arch() {
+  local os="${N_OS-}" arch="${N_ARCH-}"
+  if [[ -z "$os" ]]; then
+    os="$(uname -s)"; os="${os,,}"
+  fi
+  if [[ -z "$arch" ]]; then
+    arch="$(uname -m)"
+    case "$arch" in
+      ( x86_64 )           arch="x64" ;;
+      ( i386 | i686)       arch="x86" ;;
+      ( aarch64 | armv8l ) arch="arm64" ;;
+      ( * ) ;; # leave the rest as-is
+    esac
+  fi
+  os_arch+="$os-$arch"
+}
+
+# ----------------------------------------------------------------------
+set_base_url() {
+  base_url="https://$HOST/$DDIR/$DSEC"
+}
+
+# ----------------------------------------------------------------------
+fetch_json() {
+  json="$INFODIR/${base_url//[^[:alnum:]]/_}.json"
+  if [[ ! -r "$json" \
+     || $(($(date +%s) - $(stat -c "%Y" "$json"))) -gt $((15*60)) \
+     ]]; then
+    rm -f "$json"
+    curl -sfSL "$base_url/index.json" > "$json"
+  fi
+}
+
+# ----------------------------------------------------------------------
+set_jqcode() {
+  # https://stackoverflow.com/a/75770668/128595
+  jq_prolog='
+    def opt(f): . as $in | try f catch $in;
+    def version_cmp:
+        .version
+      | sub("^v"; "") | sub("\\+.*$"; "")
+      | capture("^(?<v>[^-]+)(?:-(?<p>.*))?$") | [.v, .p // empty]
+      | map(split(".") | map(opt(tonumber)))
+      | .[1] |= (. // {});
+    def rxquote:
+      gsub("(?<c>[.*+?^$|\\\\\\[\\](){}])"; "\\\(.c)");
+    '
+  #
+  jq_selector='.'
+  export os_arch; jq_selector+=' | select(.files | index(env.os_arch))'
+  jq_flatten='.[]'
+  case "$version" in
+    ( lts ) jq_selector+=' | select(.lts != false)' ;;
+    ( latest | current | cur ) jq_flatten='last' ;;
+    ( v[0-9]* )
+      export version
+      jq_selector+=' | select(.version | test("^" + (env.version|rxquote) + "\\b"))'
+      ;;
+    ( * ) die "unexpected version: $version" ;;
+  esac
+}
+
+# ----------------------------------------------------------------------
+note_rm() { # ver
+  if [[ ! -e "$NOTEFILE" ]]; then return; fi
+  grep -v "^$1 " "$NOTEFILE" > "$NOTEFILE." || :
+  mv "$NOTEFILE." "$NOTEFILE"
+}
+note_add() { # ver actualver dirname
+  note_rm "$1"
+  echo "$1 $2 $3" >> "$NOTEFILE"
+}
+note_get() { # ver => prints "actualver dirname"
+  if [[ ! -e "$NOTEFILE" ]]; then return; fi
+  local l="$(grep "^$1 " "$NOTEFILE" || :)"
+  if [[ -z "$l" ]]; then return; fi
+  echo "${l#* }"
+}
+note_has() { # dirname
+  if [[ ! -e "$NOTEFILE" ]]; then return 0; fi
+  grep -q " $1\$" "$NOTEFILE"
+}
+
+# ----------------------------------------------------------------------
+install() {
+  local v="$1"; shift
+  local dirname="node-$v-$os_arch"
+  local oldv="$(note_get "$version")" olddirname
+  olddirname="${oldv#* }"; oldv="${oldv%% *}"
+  if [[ "$oldv" == "$v" ]]; then oldv=""
+  else note_rm "$version"; fi
+  #
+  local msg=">>> $version"
+  if [[ "$version" != "$v" ]]; then msg+=" => $v"; fi
+  if [[ -n "$oldv" ]]; then msg+=" (replacing $oldv)"; fi
+  echo "$msg"
+  # download directory if needed
+  if [[ -d "$PREFIX/$dirname" ]]; then
+    echo "* Reusing existing: $dirname"
+  else
+    local url="$base_url/$v/$dirname.tar.gz"
+    echo "* Downloading $url"
+    local tmpdir="$INFODIR/tmp-download"
+    rm -rf "$tmpdir"; mkdir "$tmpdir"
+    curl -sfSL "$url" | tar xzf - -C "$tmpdir"
+    if [[ ! -d "$tmpdir/$dirname" ]]; then
+      die "expected directory $dirname not created" \
+          "(check $tmpdir)"
+    fi
+    mv "$tmpdir/$dirname" "$PREFIX/$dirname"
+    rmdir "$tmpdir" || die "extra content in tarball (check $tmpdir)"
+  fi
+  # handle deletion of old directory
+  if [[ -n "$oldv" ]]; then
+    if ! note_has "$olddirname"; then
+      echo "* Removing $olddirname"
+      rm -rf "$PREFIX/$olddirname"
+    fi
+  fi
+  note_add "$version" "$v" "$dirname"
+  # reset "node" symlink
+  if [[ -e "$PREFIX/node" && ! -h "$PREFIX/node" ]]; then
+    die "refusing to remove non-symlink: $PREFIX/node"
+  fi
+  rm -f "$PREFIX/node"
+  ln -sf "$dirname" "$PREFIX/node"
+  # reset bin/* symlinks
+  local b
+  for b in $(ls "$PREFIX/node/bin"); do
+    if [[ -e "$PREFIX/bin/$b" && ! -h "$PREFIX/bin/$b" ]]; then
+      echo "- (ignoring non-symlink $PREFIX/bin/$b)"
+    else
+      ln -sf "../node/bin/$b" "$PREFIX/bin/$b"
+    fi
+  done
+}
+
+# ----------------------------------------------------------------------
+run() {
+  local r="$(
+    jq -r "$jq_prolog"'
+      map('"$jq_selector"') | sort_by(version_cmp) | '"$jq_flatten"' | .version
+    ' < "$json")"
+  if [[ -z "$r" ]]; then die "no results"; fi
+  if [[ $mode = ls ]]; then echo "$r"; exit; fi
+  install "${r##*$'\n'}"
+}
+
+# ----------------------------------------------------------------------
+if [[ -z "${1-}" ]]; then die "missing arg"; fi
+mode=download
+while [[ $# -gt 0 ]]; do
+  arg="$1"; shift
+  case "$arg" in
+    ( h | -h | help | --help ) help ;;
+    ( ls | list ) mode="$arg" ;;
+    ( */* ) DSEC="${arg%%/*}"; version="${arg#*/}"; break ;;
+    ( [0-9]*  ) version="v$arg"; break ;;
+    ( v[0-9]* ) version="$arg";  break ;;
+    ( lts     ) version="$arg";  break ;;
+    ( latest | current | cur ) version="cur"; break ;;
+    ( * ) die "unknown argument: $arg" ;;
+  esac
+done
+
+set_os_arch
+set_base_url
+fetch_json
+set_jqcode
+run
