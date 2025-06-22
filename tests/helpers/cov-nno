@@ -1,0 +1,11 @@
+#!/bin/bash
+
+# kcov-ed wrapper
+
+kcov --include-path=/t/nno --bash-method=DEBUG /output \
+  /t/nno "$@"
+c=$?
+
+chown-to-outer-user /output
+
+exit $c
