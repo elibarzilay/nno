@@ -1,0 +1,41 @@
+#!/bin/bash
+
+# simple curl wrapper with caching and usage tracking
+
+set -euo pipefail
+
+curl=/usr/bin/curl
+
+args=() url=""
+for x; do
+  args+=("$x")
+  if [[ "$x" != https://* ]]; then continue; fi
+  if [[ -n "$url" ]]; then
+    echo "multiple URLs for cached curl: $*" 1>&2
+    exit 1
+  fi
+  url="$x"
+done
+
+if [[ -z "$url" ]]; then
+  exec $curl "${args[@]}"
+fi
+
+cache="/cache/${url//"/"/"~"}" isCached=0
+
+if [[ -f "$cache.out"  ]]; then isCached=1; cat "$cache.out"; fi
+if [[ -f "$cache.err"  ]]; then isCached=1; cat "$cache.err" 1>&2; fi
+if [[ -f "$cache.exit" ]]; then isCached=1; c="$(< "$cache.exit")"; fi
+if ((isCached)); then exit ${c-0}; fi
+
+echo "$url" >> "/cache/network-miss"
+c=0; $curl "${args[@]}" > "$cache.out" 2> "$cache.err" || c=$?
+
+if [[ $c -ne 0 ]]; then isCached=1; echo $c > "$cache.exit"; fi
+if [[ -s "$cache.err" ]]; then isCached=1; else rm "$cache.err"; fi
+# delete the .out only if one of the above exists
+if [[ ! -s "$cache.out" ]] && ((isCached)); then rm "$cache.out"; fi
+
+chown-to-outer-user "/cache"
+
+exec "$0" "$@"

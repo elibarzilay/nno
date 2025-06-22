@@ -1,0 +1,4 @@
+#!/bin/bash
+
+u=$USER; if [[ $u == root ]]; then u=$SUDO_USER; fi
+sudo chown -R $u:$u "$1" >/dev/null 2>&1

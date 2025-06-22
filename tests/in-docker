@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+
+###############################################################################
+# This file has three parts, separated by a "###...###" line
+#
+# 1. Outer build: selected with a "--build" flag (also triggered when running
+#    without arguments and the image doesn't exist). This part drives the
+#    process of building the docker image: it runs a fresh OS image; uses step
+#    #2 to install stuff in it; and creates an image with the results.
+#
+# 2. Inner build: the actual in-docker building of the image. The outer build
+#    step runs this using an "--inner-build" flag, and information that is used
+#    to recreate a similar in-docker user account that is the same as the real
+#    user.
+#
+# 3. Runtime: the actual running of the container, when used without one of the
+#    build flags. Will auto-call step #1 if the image doesn't exist.
+
+###############################################################################
+# Config
+
+author=eli@barzilay.org
+name=nno
+base=ubuntu:24.04
+
+###############################################################################
+
+set -euo pipefail
+die() { echo "error: $*" 1>&2; exit 1; }
+
+hash="$(sha1sum "$0")";hash="${hash%% *}" # used to detect changes in this file
+
+###############################################################################
+if [[ $# -eq 1 && "$1" = "--build" ]]; then
+if [[ -e /.dockerenv ]]; then die "Cannot run outer-build in a container"; fi
+
+echo "*** Outer build"
+
+# kill a stale build process, in case there is one that got stuck
+docker rm -f $name-build >/dev/null 2>&1 || :
+
+# start a fresh docker of $base, and run this script to do the inner build
+# (give it the information needed to create a user in the image that is like
+# the real user)
+docker pull $base
+echo /inner-build --inner-build $(id -u) $(id -nu) $(id -g) $(id -ng) \
+| docker run --name=$name-build -i --privileged -v "$0":/inner-build $base
+
+echo "*** Committing build result as $name"
+# keep a backup
+docker rmi $name:old >/dev/null 2>&1 || :
+docker tag $name $name:old >/dev/null 2>&1 || :
+docker commit --author $author --change='
+  WORKDIR /home/'"$(id -nu)"'
+  USER '"$(id -nu)"'
+  ENTRYPOINT ["/sbin/entrypoint"]
+  LABEL hash='"$hash"'
+  ' $name-build $name
+
+# in case docker run didn't die for whatever reason
+docker rm -f $name-build >/dev/null 2>&1 || :
+
+###############################################################################
+elif [[ $# -gt 1 && "$1" = "--inner-build" ]]; then
+if [[ ! -e /.dockerenv ]]; then die "Must run in inner"; fi
+
+echo "*** Inner build"
+
+shift; uid="$1" user="$2" gid="$3" group="$4"
+
+# entrypoint script built in steps
+echo "#!/bin/bash" > /sbin/entrypoint
+chmod +x /sbin/entrypoint
+
+# noninteractive during installs
+export DEBIAN_FRONTEND=noninteractive
+
+# basic updates & packages
+apt update && apt -y upgrade
+apt install -y curl jq sudo
+
+# Install bats
+gh_get() { # owner/repo path
+  mkdir -p "$2"
+  curl -sfSL https://api.github.com/repos/$1/tarball \
+    | tar xzf - --strip-components=1 -C "$2"
+}
+gh_get bats-core/bats-core    /usr/local/bats
+gh_get bats-core/bats-support /usr/local/bats/bats-support
+gh_get bats-core/bats-assert  /usr/local/bats/bats-assert
+/usr/local/bats/install.sh /usr/local
+echo "export BATS_LIB_PATH=/usr/local/bats" >> /sbin/entrypoint
+
+# from-source binaries
+pkgs=(binutils-dev build-essential cmake)
+pkgs+=(libssl-dev libcurl4-openssl-dev libelf-dev libstdc++-12-dev zlib1g-dev)
+pkgs+=(libdw-dev libiberty-dev yacc python3)
+apt install -y "${pkgs[@]}"
+#
+cd /tmp
+curl -sfSL http://ftp.gnu.org/gnu/bash/bash-3.2.57.tar.gz | tar xzf -
+cd bash-3.2.57
+./configure --disable-nls && make && make install
+cd /tmp && rm -rf bash-3.2.57
+#
+cd /tmp
+mkdir -p /tmp/kcov/build
+gh_get SimonKagstrom/kcov /tmp/kcov
+cd /tmp/kcov/build
+cmake .. && make && make install
+cd /tmp && rm -rf kcov
+#
+cd /
+apt autoremove -y "${pkgs[@]}"
+#
+apt install -y libdw1
+
+# make sudo convenient
+cat > "/etc/sudoers.d/$user" <<"EOF"
+ALL ALL=(ALL) NOPASSWD: ALL     # no password
+Defaults !fqdn                  # disable hostname lookup
+Defaults !env_reset             # don't reset env
+Defaults env_keep += "*"        # keep all vars
+Defaults !secure_path
+EOF
+
+# ubuntu >=24 comes with an annoying "ubuntu" account with the popular 1000 uid
+touch /var/mail/ubuntu; chown ubuntu /var/mail/ubuntu; userdel -r ubuntu
+
+# create the inner docker user, so it looks like the outer real user
+echo "$group:x:$gid:" >> "/etc/group"
+useradd -u "$uid" -g "$gid" -md "/home/$user" "$user"
+
+# actual entrypoint code
+cat >> /sbin/entrypoint <<EOF
+export IN_DOCKER=yes USER=$user
+if [[ \$# -eq 0 ]]; then exec /bin/bash
+else exec "\$@"; fi
+EOF
+
+###############################################################################
+else
+if [[ -e /.dockerenv ]]; then die "Cannot run in inner"; fi
+# Run
+
+# if the image is missing, run a build first
+if [[ -z "$(docker images -q $name:latest 2> /dev/null)" ]]; then
+  echo ">>> Image missing, building it"
+  sleep 1
+  "$0" --build
+fi
+imagehash="$(docker inspect --format='{{ index .Config.Labels "hash" }}' nno)"
+if [[ "$hash" != "$imagehash" ]]; then
+  echo ">>> Image config changed, rebuilding it"
+  sleep 1
+  "$0" --build
+fi
+
+# construct the docker run command...
+run=(docker run)
+run+=(-it --rm)                      # interactive run, remove when done
+run+=(--name=$name --hostname $name) # use name for the container and hostname
+run+=(--privileged)                  # no restrictions
+run+=(--net host)                    # use host network directly
+run+=(-v "$(git rev-parse --show-toplevel):/t:ro")
+if [[ -n "${RWMOUNTS-}" ]]; then
+  for d in $RWMOUNTS; do
+    if [[ ! -d "$d" ]]; then die "rwmount directory not found: ./$d"; fi
+    d1="$d"; if [[ "$d" != /* ]]; then d1="$PWD/$d"; fi
+    d2="/${d##*/}"
+    run+=(-v "$d1:$d2:rw")
+  done
+fi
+run+=($name) # run our image
+
+if [[ -e "${1-}" ]]; then
+  cd "$(dirname "$1")"
+  exe="/t/$(git rev-parse --show-prefix)$(basename "$1")"; shift
+  set -- "$exe" "$@"
+fi
+
+"${run[@]}" "$@"
+
+fi

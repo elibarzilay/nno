@@ -1,0 +1,664 @@
+#!/usr/bin/env bats
+# -*- sh -*-
+
+bats_require_minimum_version 1.12.0
+
+bats_load_library bats-support
+bats_load_library bats-assert
+
+setup_file() {
+  export PATH="/t/tests/helpers:$PATH"
+  export BASE="https://nodejs.org/download"
+  #
+  setv() { # set version vars: $v<NAME>{1,2,3}, $<NAME>dir
+    local v="${3%%$'\t'*}"; local v0="$v"
+    printf -v v${1}3 "%s" "$v"; v="${v%.*}"
+    printf -v v${1}2 "%s" "$v"; v="${v%.*}"
+    printf -v v${1}1 "%s" "$v"; v="${v%.*}"
+    local dir="node-$v0-linux-x64"
+    printf -v v${1}dir "%s" "$dir"
+    printf -v v${1}url "$BASE/%s/%s/%s.tar.gz" "$2" "$v0" "$dir"
+    export v$1{1,2,3,dir,url} 1>&3
+  }
+  tab="$(curl -sfSL $BASE/release/index.tab | tail +2 | sort -rV)"
+  rctab="$(curl -sfSL $BASE/rc/index.tab | tail +2 | sort -rV)"
+  nightlytab="$(curl -sfSL $BASE/nightly/index.tab | tail +2 | sort -rV)"
+  setv CUR release "$tab"
+  setv LTS release "$(grep -E $'[^-]\t[^\t]+$' <<<"$tab")"
+  setv TEN release "$(grep -E $'^v10' <<<"$tab")"
+  setv NINE release "$(grep -E $'^v9' <<<"$tab")"
+  setv FOUR release "$(grep -E $'^v4' <<<"$tab")"
+  setv RC_CUR rc "$rctab"
+  setv RC_TEN rc "$(grep -E $'^v10' <<<"$rctab")"
+  setv RC_LTS rc "$(grep -E $'[^-]\t[^\t]+$' <<<"$rctab")"
+  setv NIGHTLY_CUR nightly "$nightlytab"
+  setv NIGHTLY_TEN nightly "$(grep -E $'^v10' <<<"$nightlytab")"
+  setv NIGHTLY_LTS nightly "$(grep -E $'[^-]\t[^\t]+$' <<<"$nightlytab")"
+}
+
+_my_run() {
+  run --separate-stderr "$@"
+  if [[ ${#stderr_lines[*]} -gt 0 ]]; then
+    lines=("${lines[@]}" err: "${stderr_lines[@]}")
+  fi
+}
+_ok() { _my_run -0 "$@"; }
+_err() { _my_run ! "$@"; }
+
+_outputs() {
+  if [[ $# -ne ${#lines[*]} ]]; then
+    local x msg=("bad number of output lines, expected $#, received ${#lines[*]}")
+    msg+=("expected:")
+    for x in "$@"; do msg+=("  $x"); done
+    msg+=("received:")
+    for x in "${lines[@]}"; do msg+=("  $x"); done
+    printf -v msg "%s\n" "${msg[@]}"
+    fail "$msg"
+  fi
+  local i args=("$@") arg f
+  for (( i=0; i<$#; i++ )); do
+    output="${lines[i]}"
+    arg="${args[i]}" f=""
+    if [[ "$arg" == rx:* ]]; then
+      arg="${arg#rx:}"; f="--regexp"
+    fi
+    assert_output $f -- "$arg"
+  done
+}
+
+@test "meta" {
+  _ok echo "$BASH_VERSION"
+  _outputs "rx:^3.2.57\\("
+  #
+  _ok which curl
+  _outputs "/t/tests/helpers/curl"
+  # docker sudo conf should propagate all vars
+  export XXX=YYY
+  _ok env
+  assert_output --partial "XXX=YYY"
+  _ok sudo env
+  assert_output --partial "XXX=YYY"
+  #
+  _ok sudo which curl
+  _outputs "/t/tests/helpers/curl"
+  #
+  mkdir -p x/y/z; cd x/y/z
+  _ok pwd
+  _outputs "/home/$USER/x/y/z"
+  _ok sudo pwd
+  _outputs "/home/$USER/x/y/z"
+  cd ../../..; rm -rf x
+  # curl is cached
+  rm -f /tmp/[12] /cache/network-miss /cache/*barzilay.org*
+  curl -sfSL https://barzilay.org/ > /tmp/1
+  _ok cat /cache/network-miss
+  _outputs "https://barzilay.org/"
+  echo -n > /cache/network-miss
+  curl -sfSL https://barzilay.org/ > /tmp/2
+  _ok cat /cache/network-miss
+  _outputs
+  _ok diff /tmp/1 /tmp/2
+  rm -f /tmp/[12] /cache/network-miss /cache/*barzilay.org*
+}
+
+@test "basic stuff" {
+  _err which nno
+  _outputs
+  #
+  if [[ -d /output && -w /output ]]; then
+    sudo cp /t/tests/helpers/cov-nno /usr/local/bin/nno
+  else
+    sudo cp /t/nno /usr/local/bin/nno
+  fi
+  _ok which nno
+  _outputs "/usr/local/bin/nno"
+  #
+  _ok nno
+  assert_output --regexp $'^Nothing installed yet:\n'
+  #
+  _ok nno st
+  assert_output --regexp $'^Nothing installed yet:\n'
+  #
+  _ok nno status
+  assert_output --regexp $'^Nothing installed yet:\n'
+  #
+  sudo mv /usr/bin/jq{,-}
+  _err nno
+  _outputs err: "nno: missing required executable: jq"
+  sudo mv /usr/bin/jq{-,}
+  #
+  _err nno foo
+  _outputs err: "nno: unknown command: foo"
+  #
+  _err nno foo/bar
+  _outputs err: "nno: unknown command: foo/bar"
+  #
+  _err nno cur 123
+  _outputs err: "nno: \"install\" does not expect arguments, got: 123"
+  #
+  _err nno st foo
+  _outputs err: "nno: \"status\" does not expect arguments, got: foo"
+  #
+  _err nno lsr foo
+  _outputs err: "nno: \"list-remote\" does not expect arguments, got: foo"
+  #
+  _ok nno --help
+  assert_output --regexp "^Usage: nno "
+}
+
+@test "simple installs" {
+  _err which node
+  _outputs
+  #
+  _err nno -v lts
+  _outputs "! os_arch = linux-x64" \
+           err: "nno: /usr/local is not writable"
+  #
+  _err sudo nno -v 999999
+  _outputs "! os_arch = linux-x64" \
+           "! Creating missing directory: /usr/local/nno-info" \
+           "! fetching $BASE" \
+           "! fetching $BASE/release/index.json" \
+           err: "nno: no downloads matching 999999 => v999999"
+  #
+  _err sudo nno -v 999999
+  _outputs "! os_arch = linux-x64" \
+           err: "nno: no downloads matching 999999 => v999999"
+  #
+  _err sudo nno -v v999999
+  _outputs "! os_arch = linux-x64" \
+           err: "nno: no downloads matching v999999"
+  #
+  _ok sudo nno -v lts
+  _outputs "! os_arch = linux-x64" \
+           ">>> lts => $vLTS3" \
+           "* Downloading $vLTSurl"
+  #
+  _ok sudo nno -v lts
+  _outputs "! os_arch = linux-x64" \
+           ">>> lts => $vLTS3" \
+           "* Already using $vLTSdir, nothing to do"
+  #
+  _ok node --version
+  _outputs "$vLTS3"
+  #
+  _ok sudo nno -v cur
+  _outputs "! os_arch = linux-x64" \
+           ">>> cur => $vCUR3" \
+           "* Downloading $vCURurl"
+  _ok node --version
+  _outputs "$vCUR3"
+  #
+  _ok sudo nno current
+  _outputs ">>> current => cur => $vCUR3" \
+           "* Already using $vCURdir, nothing to do"
+  #
+  _ok sudo nno latest
+  _outputs ">>> latest => cur => $vCUR3" \
+           "* Already using $vCURdir, nothing to do"
+  #
+  _ok sudo nno -v lts
+  _outputs "! os_arch = linux-x64" \
+           ">>> lts => $vLTS3" \
+           "* Reusing existing $vLTSdir"
+  #
+  _ok sudo nno install lts
+  _outputs ">>> lts => $vLTS3" \
+           "* Already using $vLTSdir, nothing to do"
+  #
+  _ok sudo nno stable i
+  _outputs ">>> stable => lts => $vLTS3" \
+           "* Already using $vLTSdir, nothing to do"
+}
+
+@test "list-remote" {
+  _ok nno lsr
+  sorted="$(echo "$output" | sort --version-sort)"
+  [[ "$sorted" == "$output" ]] || fail "versions are not sorted"
+  #
+  _ok nno rls
+  sorted="$(echo "$output" | sort --version-sort)"
+  [[ "$sorted" == "$output" ]] || fail "rls alias failed"
+  #
+  _ok nno ls-remote
+  sorted="$(echo "$output" | sort --version-sort)"
+  [[ "$sorted" == "$output" ]] || fail "ls-remote alias failed"
+  #
+  _ok nno list-remote
+  sorted="$(echo "$output" | sort --version-sort)"
+  [[ "$sorted" == "$output" ]] || fail "list-remote alias failed"
+  #
+  _ok nno list-r
+  sorted="$(echo "$output" | sort --version-sort)"
+  [[ "$sorted" == "$output" ]] || fail "list-r alias failed"
+  #
+  _ok nno ls-r
+  sorted="$(echo "$output" | sort --version-sort)"
+  [[ "$sorted" == "$output" ]] || fail "ls-r alias failed"
+  #
+  _ok nno remote-ls
+  sorted="$(echo "$output" | sort --version-sort)"
+  [[ "$sorted" == "$output" ]] || fail "remote-ls alias failed"
+}
+
+@test "using auto_sudo" {
+  _ok sudo nno lts
+  _outputs ">>> lts => $vLTS3" \
+           "* Already using $vLTSdir, nothing to do"
+  #
+  _err nno lts
+  _outputs err: "nno: /usr/local is not writable"
+  #
+  export N_AUTO_SUDO=yes
+  _ok nno -v lts
+  _outputs "! os_arch = linux-x64" \
+           "! auto-sudo-ing" \
+           "! os_arch = linux-x64" \
+           ">>> lts => $vLTS3" \
+           "* Already using $vLTSdir, nothing to do"
+}
+
+@test "using version history" {
+  export N_AUTO_SUDO=yes
+  #
+  _ok nno $vTEN1
+  _outputs ">>> $vTEN1 => $vTEN3" \
+           "* Downloading $vTENurl"
+  #
+  _ok nno $vNINE2
+  _outputs ">>> $vNINE2 => $vNINE3" \
+           "* Downloading $vNINEurl"
+  #
+  _ok nno +
+  _outputs ">>> + => cur => $vCUR3" \
+           "* Reusing existing $vCURdir"
+  #
+  _ok nno +
+  _outputs ">>> + => lts => $vLTS3" \
+           "* Reusing existing $vLTSdir"
+  #
+  _ok nno +
+  _outputs ">>> + => $vTEN1 => $vTEN3" \
+           "* Reusing existing $vTENdir"
+  #
+  _ok nno +
+  _outputs ">>> + => $vNINE2 => $vNINE3" \
+           "* Reusing existing $vNINEdir"
+  #
+  _ok nno -99
+  _outputs ">>> -99 => cur => $vCUR3" \
+           "* Reusing existing $vCURdir"
+  #
+  _ok nno -99
+  _outputs ">>> -99 => lts => $vLTS3" \
+           "* Reusing existing $vLTSdir"
+  #
+  _ok nno -
+  _outputs ">>> - => cur => $vCUR3" \
+           "* Reusing existing $vCURdir"
+  #
+  _ok nno -
+  _outputs ">>> - => lts => $vLTS3" \
+           "* Reusing existing $vLTSdir"
+  #
+  _ok nno +0
+  _outputs ">>> +0 => lts => $vLTS3" \
+           "* Already using $vLTSdir, nothing to do"
+  #
+  _ok nno -0
+  _outputs ">>> -0 => lts => $vLTS3" \
+           "* Already using $vLTSdir, nothing to do"
+  #
+  _ok nno =
+  _outputs ">>> = => lts => $vLTS3" \
+           "* Already using $vLTSdir, nothing to do"
+}
+
+@test "status" {
+  _ok nno
+  _outputs "Installations at /usr/local (in order):" \
+           "* node-$vLTS3-linux-x64 (lts)" \
+           "  node-$vCUR3-linux-x64 (cur)" \
+           "  node-$vNINE3-linux-x64 ($vNINE2)" \
+           "  node-$vTEN3-linux-x64 ($vTEN1)"
+  #
+  _ok nno st
+  _outputs "Installations at /usr/local (in order):" \
+           "* node-$vLTS3-linux-x64 (lts)" \
+           "  node-$vCUR3-linux-x64 (cur)" \
+           "  node-$vNINE3-linux-x64 ($vNINE2)" \
+           "  node-$vTEN3-linux-x64 ($vTEN1)"
+  #
+  _ok nno status
+  _outputs "Installations at /usr/local (in order):" \
+           "* node-$vLTS3-linux-x64 (lts)" \
+           "  node-$vCUR3-linux-x64 (cur)" \
+           "  node-$vNINE3-linux-x64 ($vNINE2)" \
+           "  node-$vTEN3-linux-x64 ($vTEN1)"
+  #
+  _ok sudo nno $vLTS2
+  _outputs ">>> $vLTS2 => $vLTS3" \
+           "* Already using $vLTSdir, nothing to do"
+  #
+  _ok nno
+  _outputs "Installations at /usr/local (in order):" \
+           "* node-$vLTS3-linux-x64 ($vLTS2)" \
+           "+ node-$vLTS3-linux-x64 (lts)" \
+           "  node-$vCUR3-linux-x64 (cur)" \
+           "  node-$vNINE3-linux-x64 ($vNINE2)" \
+           "  node-$vTEN3-linux-x64 ($vTEN1)"
+  #
+  _ok sudo mkdir /usr/local/node-meh-linux-x64
+  _ok sudo mv /usr/local/{,-}node-$vNINE3-linux-x64
+  _ok nno
+  _outputs "Installations at /usr/local (in order):" \
+           "* node-$vLTS3-linux-x64 ($vLTS2)" \
+           "+ node-$vLTS3-linux-x64 (lts)" \
+           "  node-$vCUR3-linux-x64 (cur)" \
+           "? node-$vNINE3-linux-x64 ($vNINE2)" \
+           "  node-$vTEN3-linux-x64 ($vTEN1)" \
+           "  node-meh-linux-x64 -"
+  #
+  _ok sudo mv /usr/local/nno-info/installed{,-}
+  _ok nno
+  _outputs "Installations at /usr/local (in order):" \
+           "(nno-info/installed missing: no installation info)" \
+           "* node-$vLTS3-linux-x64 -" \
+           "  node-meh-linux-x64 -" \
+           "  node-$vCUR3-linux-x64 -" \
+           "  node-$vTEN3-linux-x64 -"
+  _ok sudo mv /usr/local/nno-info/installed{-,}
+  _ok sudo rmdir /usr/local/node-meh-linux-x64
+  _ok sudo mv /usr/local/{-,}node-$vNINE3-linux-x64
+  #
+  (cd /usr/local; sudo rm node; sudo ln -sf node-$vNINE3-linux-x64 node)
+  _ok nno
+  _outputs "Installations at /usr/local (in order):" \
+           "  node-$vLTS3-linux-x64 ($vLTS2)" \
+           "+ node-$vLTS3-linux-x64 (lts)" \
+           "  node-$vCUR3-linux-x64 (cur)" \
+           "* node-$vNINE3-linux-x64 ($vNINE2)" \
+           "  node-$vTEN3-linux-x64 ($vTEN1)"
+}
+
+@test "indifferent to manual removals and installs" {
+  _ok sudo nno lts
+  #
+  (cd /usr/local; sudo mv node-$vNINE3-linux-x64 node-$vFOUR3-linux-x64)
+  _ok nno
+  _outputs "Installations at /usr/local (in order):" \
+           "* node-$vLTS3-linux-x64 (lts)" \
+           "+ node-$vLTS3-linux-x64 ($vLTS2)" \
+           "  node-$vCUR3-linux-x64 (cur)" \
+           "? node-$vNINE3-linux-x64 ($vNINE2)" \
+           "  node-$vTEN3-linux-x64 ($vTEN1)" \
+           "  node-$vFOUR3-linux-x64 -"
+  # doesn't verify actual version!
+  _ok sudo nno $vFOUR1
+  _outputs ">>> $vFOUR1 => $vFOUR3" \
+           "* Reusing existing $vFOURdir"
+  #
+  _ok nno # removes the bad entry
+  _outputs "Installations at /usr/local (in order):" \
+           "* node-$vFOUR3-linux-x64 ($vFOUR1)" \
+           "  node-$vLTS3-linux-x64 (lts)" \
+           "+ node-$vLTS3-linux-x64 ($vLTS2)" \
+           "  node-$vCUR3-linux-x64 (cur)" \
+           "  node-$vTEN3-linux-x64 ($vTEN1)"
+  #
+  _ok sudo nno -v $vNINE1
+  _outputs "! os_arch = linux-x64" \
+           ">>> $vNINE1 => $vNINE3" \
+           "* Downloading $vNINEurl"
+  #
+  _ok nno
+  _outputs "Installations at /usr/local (in order):" \
+           "* node-$vNINE3-linux-x64 ($vNINE1)" \
+           "  node-$vFOUR3-linux-x64 ($vFOUR1)" \
+           "  node-$vLTS3-linux-x64 (lts)" \
+           "+ node-$vLTS3-linux-x64 ($vLTS2)" \
+           "  node-$vCUR3-linux-x64 (cur)" \
+           "  node-$vTEN3-linux-x64 ($vTEN1)"
+}
+
+@test "using auto" {
+  mkdir -p x/y/z; cd x/y/z
+  #
+  _err sudo nno auto
+  _outputs err: "nno: no auto file found"
+  #
+  _err sudo nno rc/auto
+  _outputs err: "nno: cannot use \"auto\" with a channel: rc/auto"
+  #
+  echo cur > .nvmrc
+  _ok sudo nno auto
+  _outputs ">>> auto => ./.nvmrc => cur => $vCUR3" \
+           "* Reusing existing $vCURdir"
+  #
+  cp .nvmrc ~/x/y
+  _ok sudo nno auto
+  _outputs ">>> auto => ./.nvmrc => cur => $vCUR3" \
+           "* Already using $vCURdir, nothing to do"
+  #
+  rm .nvmrc
+  _ok sudo nno auto
+  _outputs ">>> auto => ../.nvmrc => cur => $vCUR3" \
+           "* Already using $vCURdir, nothing to do"
+  #
+  mv ~/x/y/.nvmrc ~/x/.n-node-version
+  _ok sudo nno auto
+  _outputs ">>> auto => ../../.n-node-version => cur => $vCUR3" \
+           "* Already using $vCURdir, nothing to do"
+  #
+  mv ~/x/.n-node-version ~/.node-version
+  _ok sudo nno auto
+  _outputs ">>> auto => ~/.node-version => cur => $vCUR3" \
+           "* Already using $vCURdir, nothing to do"
+  #
+  sudo mv ~/.node-version /home/.nvmrc
+  _ok sudo nno auto
+  _outputs ">>> auto => /home/.nvmrc => cur => $vCUR3" \
+           "* Already using $vCURdir, nothing to do"
+  #
+  sudo mv /home/.nvmrc /.nvmrc
+  _ok sudo nno auto
+  _outputs ">>> auto => /.nvmrc => cur => $vCUR3" \
+           "* Already using $vCURdir, nothing to do"
+  #
+  sudo rm /.nvmrc
+  for a in .n-node-version .node-version .nvmrc; do echo lts > ../$a; done
+  echo '{ "engines": { "node": "'$vLTS2'" }}' > ../package.json
+  _ok sudo nno auto
+  _outputs ">>> auto => ../.n-node-version => lts => $vLTS3" \
+           "* Reusing existing $vLTSdir"
+  #
+  cp ../package.json .
+  _ok sudo nno auto
+  _outputs ">>> auto => ./package.json => $vLTS2 => $vLTS3" \
+           "* Already using $vLTSdir, nothing to do"
+  #
+  cp ../.nvmrc .
+  _ok sudo nno auto
+  _outputs ">>> auto => ./.nvmrc => lts => $vLTS3" \
+           "* Already using $vLTSdir, nothing to do"
+  #
+  cp ../.node-version .
+  _ok sudo nno auto
+  _outputs ">>> auto => ./.node-version => lts => $vLTS3" \
+           "* Already using $vLTSdir, nothing to do"
+  #
+  cp ../.n-node-version .
+  _ok sudo nno auto
+  _outputs ">>> auto => ./.n-node-version => lts => $vLTS3" \
+           "* Already using $vLTSdir, nothing to do"
+  #
+  rm .n-node-version
+  _ok sudo nno auto
+  _outputs ">>> auto => ./.node-version => lts => $vLTS3" \
+           "* Already using $vLTSdir, nothing to do"
+  #
+  rm .node-version
+  _ok sudo nno auto
+  _outputs ">>> auto => ./.nvmrc => lts => $vLTS3" \
+           "* Already using $vLTSdir, nothing to do"
+  #
+  rm .nvmrc
+  _ok sudo nno auto
+  _outputs ">>> auto => ./package.json => $vLTS2 => $vLTS3" \
+           "* Already using $vLTSdir, nothing to do"
+  #
+  rm package.json
+  _ok sudo nno auto
+  _outputs ">>> auto => ../.n-node-version => lts => $vLTS3" \
+           "* Already using $vLTSdir, nothing to do"
+  #
+  rm ../.n-node-version
+  _ok sudo nno auto
+  _outputs ">>> auto => ../.node-version => lts => $vLTS3" \
+           "* Already using $vLTSdir, nothing to do"
+  #
+  rm ../.node-version
+  _ok sudo nno auto
+  _outputs ">>> auto => ../.nvmrc => lts => $vLTS3" \
+           "* Already using $vLTSdir, nothing to do"
+  #
+  echo v888888 > .nvmrc
+  _err sudo nno auto
+  _outputs err: "nno: no downloads matching auto => ./.nvmrc => v888888"
+  #
+  echo 888888 > .nvmrc
+  _err sudo nno auto
+  _outputs err: "nno: no downloads matching auto => ./.nvmrc => 888888 => v888888"
+  #
+  rm -f {.,..}/{.n*,package.json}
+  echo -n > .nvmrc
+  _err sudo nno auto
+  _outputs err: "nno: no version specified in ./.nvmrc"
+  #
+  echo >> .nvmrc
+  _err sudo nno auto
+  _outputs err: "nno: no version specified in ./.nvmrc"
+  #
+  _ok sudo nno auto/lts
+  _outputs ">>> auto/lts => lts => $vLTS3" \
+           "* Already using $vLTSdir, nothing to do"
+  #
+  echo "#bleh" >> .nvmrc
+  _err sudo nno auto
+  _outputs err: "nno: no version specified in ./.nvmrc"
+  #
+  _ok sudo nno auto/lts
+  _outputs ">>> auto/lts => lts => $vLTS3" \
+           "* Already using $vLTSdir, nothing to do"
+  #
+  echo "  # blah blah" >> .nvmrc
+  _err sudo nno auto
+  _outputs err: "nno: no version specified in ./.nvmrc"
+  #
+  _ok sudo nno auto/lts
+  _outputs ">>> auto/lts => lts => $vLTS3" \
+           "* Already using $vLTSdir, nothing to do"
+  #
+  { echo; echo "  latest #blah blah"; } >> .nvmrc
+  _ok sudo nno auto
+  _outputs ">>> auto => ./.nvmrc => latest => cur => $vCUR3" \
+           "* Reusing existing $vCURdir"
+  # uses first thing found in the file
+  { echo; echo "lts"; } >> .nvmrc
+  _ok sudo nno auto
+  _outputs ">>> auto => ./.nvmrc => latest => cur => $vCUR3" \
+           "* Already using $vCURdir, nothing to do"
+  #
+  echo "foo #bar" > .nvmrc
+  _err sudo nno auto
+  _outputs err: "nno: bad version in auto file: auto => ./.nvmrc => foo"
+  #
+  echo "foo#bar #baz" > .nvmrc
+  _err sudo nno auto
+  _outputs err: "nno: bad version in auto file: auto => ./.nvmrc => foo#bar"
+  #
+  echo auto > .nvmrc
+  _err sudo nno auto
+  _outputs err: "nno: bad version in auto file: auto => ./.nvmrc => auto"
+  #
+  echo auto > .nvmrc
+  _err sudo nno auto/cur
+  _outputs err: "nno: bad version in auto file: auto/cur => ./.nvmrc => auto"
+  #
+  echo auto/lts > .nvmrc
+  _err sudo nno auto/cur
+  _outputs err: "nno: bad version in auto file: auto/cur => ./.nvmrc => auto/lts"
+  #
+  rm .nvmrc; echo '{ "engines": { "node": "'auto'" }}' > package.json
+  _err sudo nno auto/cur
+  _outputs err: "nno: bad version in auto file: auto/cur => ./package.json => auto"
+  #
+  echo '{ "engines": { "x": "'auto'" }}' > package.json
+  _ok sudo nno -v auto/cur
+  _outputs "! os_arch = linux-x64" \
+           "! no version specified in ./package.json, use fallback" \
+           ">>> auto/cur => cur => $vCUR3" \
+           "* Already using node-$vCUR3-linux-x64, nothing to do"
+  #
+  echo '{' > package.json
+  _ok sudo nno -v auto/cur
+  _outputs "! os_arch = linux-x64" \
+           "! no version specified in ./package.json, use fallback" \
+           ">>> auto/cur => cur => $vCUR3" \
+           "* Already using node-$vCUR3-linux-x64, nothing to do"
+  #
+  rm package.json
+  _ok sudo nno -v auto/cur
+  _outputs "! os_arch = linux-x64" \
+           "! no auto file found, use fallback" \
+           ">>> auto/cur => cur => $vCUR3" \
+           "* Already using $vCURdir, nothing to do"
+  #
+  _ok sudo nno -v auto/=
+  _outputs "! os_arch = linux-x64" \
+           "! no auto file found, use fallback" \
+           ">>> auto/= => = => cur => $vCUR3" \
+           "* Already using $vCURdir, nothing to do"
+  #
+  _ok sudo nno -v auto/lts
+  _outputs "! os_arch = linux-x64" \
+           "! no auto file found, use fallback" \
+           ">>> auto/lts => lts => $vLTS3" \
+           "* Reusing existing $vLTSdir"
+  #
+  cd ../../..; rm -rf x
+}
+
+@test "channels" {
+  _err sudo nno -v foo/cur
+  _outputs "! os_arch = linux-x64" \
+           err: "nno: unknown download channel: foo" \
+                "(check $BASE)"
+  #
+  _ok sudo nno -v rc/cur
+  _outputs "! os_arch = linux-x64" \
+           "! fetching $BASE/rc/index.json" \
+           ">>> rc/cur => $vRC_CUR3" \
+           "* Downloading $vRC_CURurl"
+  #
+  _ok sudo nno -v rc/lts
+  _outputs "! os_arch = linux-x64" \
+           ">>> rc/lts => $vRC_LTS3" \
+           "* Downloading $vRC_LTSurl"
+  #
+  _ok sudo nno -v nightly/lts
+  _outputs "! os_arch = linux-x64" \
+           "! fetching $BASE/nightly/index.json" \
+           ">>> nightly/lts => $vNIGHTLY_LTS3" \
+           "* Downloading $vNIGHTLY_LTSurl"
+  #
+  _ok sudo nno -2
+  _outputs ">>> -2 => rc/cur => $vRC_CUR3" \
+           "* Reusing existing $vRC_CURdir"
+  _ok sudo nno -2
+  _outputs ">>> -2 => rc/lts => $vRC_LTS3" \
+           "* Reusing existing $vRC_LTSdir"
+  _ok sudo nno -2
+  _outputs ">>> -2 => nightly/lts => $vNIGHTLY_LTS3" \
+           "* Reusing existing $vNIGHTLY_LTSdir"
+}

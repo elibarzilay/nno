@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+cd "$(dirname "$0")"
+rm -rf output; mkdir -p output cache
+
+RWMOUNTS="cache"
+
+if [[ "${COVERAGE-}" == [yY]* ]]; then RWMOUNTS+=" output"; fi
+
+RWMOUNTS="$RWMOUNTS" ./in-docker run-tests

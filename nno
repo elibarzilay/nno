@@ -1,81 +1,204 @@
 #!/usr/bin/env bash
 
-# ----------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
-# >>> Customization variables can be set here
+# Note: for the main downloads,
+#   "https://nodejs.org/dist/" is the same as ".../download/release/"
 
-# ----------------------------------------------------------------------
-
-HOST="${N_HOST-nodejs.org}"
-DDIR="download"
-DSEC="release" # $version can have a different "sec/" prefix
+N_URL="${N_URL-https://nodejs.org/download/}"
+DEFAULT_CHANNEL="release" CHANNEL="release"
 PREFIX="/usr/local"
 MYNAME="$(basename "$0")"
 
-# Note: for the main downloads,
-#   "https://$HOST/dist/" is the same as "https://$HOST/download/release/"
-
-# ----------------------------------------------------------------------
-set -eu
-die() { printf "%s\n" "$@" 1>&2; exit 1; }
-
-# ----------------------------------------------------------------------
-
-if [[ "${N_AUTO_SUDO-}" = yes && "$(id -u)" != 0 ]]; then
-  exec sudo "$0" "$@"
-fi
-
-# ----------------------------------------------------------------------
 INFODIR="$PREFIX/$MYNAME-info"
-NOTEFILE="$INFODIR/vers"
-if [[ ! -d "$INFODIR" ]]; then mkdir "$INFODIR"; fi
+BINDIR="$PREFIX/bin"
+DIRLINK="$PREFIX/node"
 
-# ----------------------------------------------------------------------
+JSON_CACHE_TIME=$((60*60))
+CHANNELS_CACHE_TIME=$((14*24*60*60))
+
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+shopt -s extglob
+
+die() { { printf '%s: ' "$MYNAME"; printf '%s\n' "$@"; } 1>&2; exit 1; }
+
+no_args() {
+  if [[ $# -gt 0 ]]; then
+    die "\"${FUNCNAME[1]}\" does not expect arguments, got: $*"
+  fi
+}
+
+N_URL="${N_URL%/}"
+dbg=:
+
+# -----------------------------------------------------------------------------
+
 help() {
   local me="$MYNAME"
-  echo "$MYNAME <ver>    -- install a version"
-  echo "$MYNAME ls <ver> -- list all versions"
+  printf '%s\n' \
+    "Usage: $MYNAME [flags] [<command>] [<version>] [args...]" \
+    "" \
+    "* <command> and <version> can be given in any order, both optional:" \
+    "  $MYNAME <version>" \
+    "    same as \"$MYNAME install <version>\" or \"$MYNAME <version> i\"" \
+    "  $MYNAME" \
+    "    same as \"$MYNAME status\"" \
+    "" \
+    "Commands:" \
+    "* install | i <version>" \
+    "  install the specified version" \
+    "* status | st" \
+    "  show downloaded versions, indicating active one" \
+    "* list-remote | lsr | ls-remote | rls [<version>]" \
+    "  list available (remote) versions, matching <version> if given" \
+    "* help | h" \
+    "  show this text" \
+    "" \
+    "Version specifiers:" \
+    "* <version>" \
+    "  numeric version (possibly incomplete), optional \"v\" prefix" \
+    "    (e.g. \"v22\",  or \"22.16.0\")" \
+    "* lts | stable" \
+    "  latest long-term support version" \
+    "* cur | current | latest" \
+    "  latest released version" \
+    "* <channel>/<version>" \
+    "  specify download channel (= directory), e.g., \"release\" (default)," \
+    "  \"rc\", \"test\", etc; see the directories at $N_URL" \
+    "" \
+    "Magic versions:" \
+    "* auto" \
+    "  read the version from a file, similar to n:" \
+    "    .n-node-version, .node-version, .nvmrc, or package.json" \
+    "  (handles only the above, no version range specs)" \
+    "* auto/<version>" \
+    "  same as \"auto\", but if no version file is present, fallback to the" \
+    "  specified version, e.g., \"auto/=\" will keep the current version if" \
+    "  no auto file is found" \
+    "* - | -1 | -2 | ..." \
+    "  - or -1 uses the last version, -2 is second-to-last, etc" \
+    "* + | +1 | +2 | ..." \
+    "  + or +1 uses the first installed version, +2 is second, etc;" \
+    "  note that installing moves a version to the end position, so using +" \
+    "  repeatedly will cycle all installed versions" \
+    "  + / - are usually the same as -99 / +99" \
+    "* -0 | +0 | =" \
+    "  use the currently installed version, e.g., if you used \"$MYNAME lts\"" \
+    "  then \"$MYNAME lsr -0\" the the same as \"$MYNAME lsr lts\"; \"=\" is a" \
+    "  convenient mnemonic (these are particularly useful as an auto fallback)" \
+    "" \
+    "Flags:" \
+    "* -v | --verbose: more verbose output" \
+    "" \
+    "Environment variables:" \
+    "* \$N_URL:   base URL for downloads ($N_URL)" \
+    "* \$N_OS:    override OS name (default: \"uname -s\")" \
+    "* \$N_ARCH:  override architecture name (default: \"uname -m\")" \
+    "* \$N_AUTO_SUDO: automatically use sudo when needed"
   exit
 }
 
-# ----------------------------------------------------------------------
-set_os_arch() {
-  local os="${N_OS-}" arch="${N_ARCH-}"
-  if [[ -z "$os" ]]; then
-    os="$(uname -s)"; os="${os,,}"
-  fi
-  if [[ -z "$arch" ]]; then
-    arch="$(uname -m)"
-    case "$arch" in
-      ( x86_64 )           arch="x64" ;;
-      ( i386 | i686)       arch="x86" ;;
-      ( aarch64 | armv8l ) arch="arm64" ;;
-      ( * ) ;; # leave the rest as-is
-    esac
-  fi
-  os_arch+="$os-$arch"
+# -----------------------------------------------------------------------------
+# required executables
+
+ensure_exes() {
+  local e missing=()
+  for e in curl jq; do
+    if [[ "$(type -t $e)" != file ]]; then missing+=($e); fi
+  done
+  if [[ ${#missing[*]} -eq 0 ]]; then return; fi
+  local msg="missing required executable"
+  if [[ ${#missing[*]} -gt 1 ]]; then msg+="s"; fi
+  msg+=": "
+  missing="$(printf ', %s' "${missing[@]}")"
+  msg+="${missing:2}"
+  die "$msg"
 }
 
-# ----------------------------------------------------------------------
-set_base_url() {
-  base_url="https://$HOST/$DDIR/$DSEC"
-}
+# -----------------------------------------------------------------------------
+# test directory existence & access
 
-# ----------------------------------------------------------------------
-fetch_json() {
-  json="$INFODIR/${base_url//[^[:alnum:]]/_}.json"
-  if [[ ! -r "$json" \
-     || $(($(date +%s) - $(stat -c "%Y" "$json"))) -gt $((15*60)) \
-     ]]; then
-    rm -f "$json"
-    curl -sfSL "$base_url/index.json" > "$json"
+access=r
+ensure_dirs() {
+  local d
+  for d in "$PREFIX" "$INFODIR" "$BINDIR"; do
+    if [[ ! -e "$d" ]]; then
+      if [[ "${1-}" == "test-only" ]]; then return 1; fi
+      $dbg "Creating missing directory: $d"
+      mkdir -p "$d"
+    elif [[ ! -d "$d" ]]; then
+      die "$d is not a directory"
+    elif [[ "$access" == rw && ! -w "$d" ]]; then
+      die "$d is not writable"
+    fi
+  done
+  if [[ -e "$DIRLINK" && ! -h "$DIRLINK" ]]; then
+    die "$DIRLINK expected to be a symlink"
   fi
 }
 
-# ----------------------------------------------------------------------
-set_jqcode() {
+# -----------------------------------------------------------------------------
+maybe_sudo() {
+  if [[ "$access" == rw && "${N_AUTO_SUDO-}" == yes && "$(id -u)" != 0 ]]; then
+    $dbg "auto-sudo-ing"
+    exec sudo -E "$@"
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# cached fetching
+
+NOW=$(date +%s) fetched=""
+cached_fetch() { # url timeout, sets $fetched to the file with the contents
+  local url="$1" expire="$2"
+  ensure_dirs
+  fetched="$INFODIR/${url//[^[:alnum:]]/_}"
+  if [[ ! -r "$fetched" \
+     || $(($NOW - $(stat -c "%Y" "$fetched"))) -gt $expire ]]; then
+    rm -f "$fetched"
+    $dbg "fetching $url"
+    local c=0; curl -sfSL "$url" > "$fetched" 2> "$fetched.err" || c=$?
+    if [[ $c -eq 22 ]]; then rm "$fetched"; die "URL not found: $url"; fi
+    if [[ ! -s "$fetched.err" ]]; then cat "$fetched.err" 1>&2; fi
+    rm -f "$fetched.err"
+    if [[ $c -ne 0 ]]; then exit $c; fi
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# verify $CHANNEL exists
+
+verify_channel() {
+  # find all channels (download dirs)
+  cached_fetch "$N_URL" $CHANNELS_CACHE_TIME
+  local channels=":" index="$(< "$fetched")"
+  local rx='<a href="([^"]+)">([^<>]+)</a>(.*)$'
+  while [[ "$index" =~ $rx && "${BASH_REMATCH[1]}" == "${BASH_REMATCH[2]}" ]]; do
+    local c="${BASH_REMATCH[1]}"; c="${c%/}"
+    index="${BASH_REMATCH[3]}"
+    if [[ "$c" == ..* ]]; then continue; fi
+    # optional, but an expensive overkill
+    # if ! curl -sfSL -I "$N_URL/$d/index.json" >/dev/null 2>&1; then; continue; fi
+    channels+="$c:"
+  done
+  if [[ "$channels" != *":$CHANNEL:"* ]]; then
+    die "unknown download channel: $CHANNEL" \
+        "(check $N_URL)"
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# fetch and parse index.json
+
+get_versions() {
+  verify_channel
+  local url="$N_URL/$CHANNEL/index.json"
+  cached_fetch "$url" $JSON_CACHE_TIME
+  json="$fetched"
   # https://stackoverflow.com/a/75770668/128595
-  jq_prolog='
+  local prolog='
     def opt(f): . as $in | try f catch $in;
     def version_cmp:
         .version
@@ -87,31 +210,45 @@ set_jqcode() {
       gsub("(?<c>[.*+?^$|\\\\\\[\\](){}])"; "\\\(.c)");
     '
   #
-  jq_selector='.'
-  export os_arch; jq_selector+=' | select(.files | index(env.os_arch))'
-  jq_flatten='.[]'
-  case "$version" in
-    ( lts ) jq_selector+=' | select(.lts != false)' ;;
-    ( latest | current | cur ) jq_flatten='last' ;;
+  local selector='.'
+  export os_arch; selector+=' | select(.files | index(env.os_arch))'
+  local flatten='.[]'
+  case "$VERSION" in
+    ( lts ) selector+=' | select(.lts != false)' ;;
+    ( cur ) flatten='last' ;;
     ( v[0-9]* )
-      export version
-      jq_selector+=' | select(.version | test("^" + (env.version|rxquote) + "\\b"))'
+      export VERSION
+      selector+=' | select(.version | test("^"+(env.VERSION|rxquote)+"\\b"))'
       ;;
-    ( * ) die "unexpected version: $version" ;;
+    ( "" ) : ;; # any version
+    ( * ) die "internal error" ;;
   esac
+  VERSIONS="$(
+    jq -r "$prolog"'
+      map('"$selector"') | sort_by(version_cmp) | '"$flatten"' | .version
+    ' < "$json")"
+  if [[ -z "$VERSIONS" ]]; then die "no downloads matching $VERCHAIN"; fi
+  BEST_VERSION="${VERSIONS##*$'\n'}"
 }
 
-# ----------------------------------------------------------------------
-note_rm() { # ver
+# -----------------------------------------------------------------------------
+# info file
+
+NOTEFILE="$INFODIR/installed"
+
+note_read_arr() { # array_var
+  IFS=$'\n' read -rd '' -a "$1" < "$NOTEFILE" || :
+}
+note_rm() { # ch/ver
   if [[ ! -e "$NOTEFILE" ]]; then return; fi
   grep -v "^$1 " "$NOTEFILE" > "$NOTEFILE." || :
   mv "$NOTEFILE." "$NOTEFILE"
 }
-note_add() { # ver actualver dirname
+note_add() { # ch/ver actualver dirname
   note_rm "$1"
   echo "$1 $2 $3" >> "$NOTEFILE"
 }
-note_get() { # ver => prints "actualver dirname"
+note_get() { # ch/ver => prints "actualver dirname"
   if [[ ! -e "$NOTEFILE" ]]; then return; fi
   local l="$(grep "^$1 " "$NOTEFILE" || :)"
   if [[ -z "$l" ]]; then return; fi
@@ -121,25 +258,264 @@ note_has() { # dirname
   if [[ ! -e "$NOTEFILE" ]]; then return 0; fi
   grep -q " $1\$" "$NOTEFILE"
 }
+note_gc() {
+  # remove stale notes, in case of manual removals
+  local new_notes=() notes n d
+  note_read_arr notes
+  for n in "${notes[@]}"; do
+    d="$PREFIX/${n##* }"
+    if [[ -d "$d" ]]; then new_notes+=("$n"); fi
+  done
+  if [[ "${#new_notes[@]}" -eq 0 ]]; then printf ''
+  else printf '%s\n' "${new_notes[@]}"; fi \
+    > "$NOTEFILE"
+}
 
-# ----------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# version management & parsing
+
+VERCHAIN=""
+verchain_add() {
+  if [[ -z "$1" ]]; then return; fi
+  if [[ -z "$VERCHAIN" ]]; then VERCHAIN="$1"; return; fi
+  if [[ "${VERCHAIN##* }" == @(|"$CHANNEL/")"$1" ]]; then return; fi
+  VERCHAIN+=" => $1"
+}
+
+get_auto_version() { # sets $x and $fname (for human printouts)
+  local f up="." found owd="$PWD"
+  while true; do
+    for f in .n-node-version .node-version .nvmrc package.json; do
+      if [[ -f $f ]]; then break 2; fi
+    done
+    if [[ "$PWD" == / ]]; then cd "$owd"; x=""; return; fi
+    cd ..
+    if [[ $up == . ]]; then up=..; else up=$up/..; fi
+  done
+  if [[ ${#up} -le 5 ]]; then found=$up
+  elif [[ "$PWD/" == "$HOME"/* ]]; then found="~${PWD#$HOME}"
+  else found="$PWD"
+  fi
+  fname="${found%/}/$f"
+  if [[ "$f" == package.json ]]; then
+    x="$(jq -r '.engines.node // ""' <"$f" 2>/dev/null || :)"
+  else
+    x="$(< "$f")"
+    local rx=$'(^|\n) *([^# \n][^ \n]*)'
+    if [[ "$x" =~ $rx ]]; then x="${BASH_REMATCH[2]}"; else x=""; fi
+  fi
+  cd "$owd"
+}
+
+get_nth_version() { # sets $x
+  if [[ ! -e "$NOTEFILE" || ! -s "$NOTEFILE" ]]; then
+    x=lts # pretend that lts was there when empty
+    return
+  fi
+  local l s="${1:0:1}" n="${1:1}"
+  if [[ $s == "=" ]]; then s=+; n=0; fi
+  if [[ -z "$n" ]]; then n=1; fi
+  if [[ $n -eq 0 ]];  then l="$(tail -1 "$NOTEFILE")"
+  else
+    local butlast="$(head -n -1 "$NOTEFILE")"
+    if [[ -z "$butlast" ]]; then l=lts # same: pretend as above
+    elif [[ $s == + ]]; then l="$(head -n $n <<<"$butlast" | tail -1)"
+    else                     l="$(tail -n $n <<<"$butlast" | head -1)"
+    fi
+  fi
+  x="${l%% *}"
+  if [[ "$x" == $DEFAULT_CHANNEL/* ]]; then x="${x#$DEFAULT_CHANNEL/}"; fi
+}
+
+parse_vers() { # sets $x
+  local nest="${VERCHAIN%% *}"
+  verchain_add "$1"
+  case "$1" in
+    ( auto | auto/* )
+      badver() { die "bad version in auto file: $VERCHAIN"; }
+      case "$nest" in
+        ( auto | auto/* | [+-]* ) badver ;;
+        ( */* ) die "cannot use \"auto\" with a channel: $nest" ;;
+      esac
+      local fname="" err=""
+      get_auto_version
+      if [[ -z "$fname" ]]; then err="no auto file found"
+      elif [[ -z "$x" ]]; then err="no version specified in $fname"
+      fi
+      if [[ -z "$err" ]]; then verchain_add "$fname"
+      elif [[ "$1" == auto/* ]]; then
+        $dbg "$err, use fallback"
+        x="${1#auto/}"
+        verchain_add "$x"
+      else die "$err"
+      fi
+      parse_vers "$x"
+      if [[ -z "$x" ]]; then badver; fi
+      ;;
+    ( [+-]*([0-9]) | "=" )
+      get_nth_version "$1"
+      if [[ -z "$x" ]]; then die "internal error: $VERCHAIN got nothing"; fi
+      parse_vers "$x"
+      ;;
+    ( */* ) CHANNEL="${1%/*}"; parse_vers "${1##*/}" ;;
+    ( ?(v)[0-9]*([-.[:alnum:]]) ) x="v${1#v}" ;;
+    ( lts | stable              ) x="lts" ;;
+    ( latest | current | cur    ) x="cur" ;;
+    ( * ) x="" ;;
+  esac
+}
+
+# -----------------------------------------------------------------------------
+# command line parsing
+
+CMD=() VERSION=""
+
+set_os_arch() { # move to the command line parsing section, call it from set_cmd
+  local os="${N_OS-}" arch="${N_ARCH-}"
+  if [[ -z "$os" ]]; then os="$(uname -s)"; fi
+  if [[ -z "$arch" ]]; then arch="$(uname -m)"; fi
+  os="$(tr "[:upper:]" "[:lower:]" <<<"$os")"
+  arch="$(tr "[:upper:]" "[:lower:]" <<<"$arch")"
+  case "$arch" in
+    ( x86_64 )           arch="x64" ;;
+    ( i386 | i686)       arch="x86" ;;
+    ( aarch64 | armv8l ) arch="arm64" ;;
+    ( * ) ;; # leave the rest as-is
+  esac
+  os_arch+="$os-$arch"
+  $dbg "os_arch = $os_arch"
+}
+
+parse_verb() { # sets $x
+  case "$1" in
+    ( h?(elp)    ) x=help ;;
+    ( st?(atus)  ) x=status ;;
+    ( lsr | rls | @(list|ls)-@(remote|r) | @(remote|r)-@(list|ls) )
+                   x=list-remote ;;
+    ( i?(nstall) ) x=install ;;
+    ( * )          x="" ;;
+  esac
+}
+
+set_cmd() {
+  # flags first
+  while [[ $# -gt 0 && "$1" == -* ]]; do
+    case "$1" in
+      ( -h | --help ) help ;;
+      ( -v | --verbose )
+        debug_echo() { echo "! $*"; }
+        dbg=debug_echo
+        shift
+        ;;
+      ( -*([0-9]) ) break ;; # history offset
+      ( * ) die "unknown flag: $1" ;;
+    esac
+  done
+  set_os_arch
+  # first two arguments specify verb & version in any order, both optional
+  local verb= vers=
+  maybe_set() { # str curval name
+    if [[ -n "$2" ]]; then return 1; else parse_$3 "$1" && [[ -n "$x" ]]; fi
+  }
+  while [[ $# -gt 0 && ( -z "$verb" || -z "$vers" ) ]]; do
+    local x="$1"
+    if   maybe_set "$1" "$verb" verb; then verb="$x"; shift
+    elif maybe_set "$1" "$vers" vers; then vers="$x"; shift
+    else break; fi
+  done
+  # default: got version => install, no args => status
+  if [[ -z "$verb" ]]; then
+    if [[ -n "$vers" ]]; then verb=install
+    elif [[ $# -eq 0 ]]; then verb=status
+    else die "unknown command: $*"
+    fi
+  fi
+  if [[ "$verb" == install ]]; then access=rw; fi
+  verchain_add "$vers"
+  CMD=("$verb" "$@") VERSION="$vers"
+}
+
+# -----------------------------------------------------------------------------
+status() {
+  no_args "$@"
+  if ! ensure_dirs test-only; then
+    echo "Nothing installed yet:"; echo; help
+  elif [[ ! -e "$DIRLINK" ]]; then die "$DIRLINK does not exist"
+  elif [[ ! -d "$DIRLINK" ]]; then die "$DIRLINK is not a directory"
+  elif [[ ! -h "$DIRLINK" ]]; then die "$DIRLINK is not a symlink"
+  fi
+  echo "Installations at $PREFIX (in order):"
+  local active="$(readlink "$DIRLINK")"
+  local seen=$'\n'
+  is_seen() { [[ "$seen" == *$'\n'"$1"$'\n'* ]]; }
+  show_dir() { # name explicit
+    local line="" name="$1" explicit="${2-}"
+    if is_seen "$name"; then line+="+"
+    elif [[ ! -d "$PREFIX/$name" ]]; then line+="?"
+    elif [[ "$name" == "$active" ]]; then line+="*"
+    else line+=" "; fi
+    line+=" $name"
+    if [[ -n "$explicit" ]]; then line+=" $explicit"; fi
+    echo "$line"
+    seen+="$name"$'\n'
+  }
+  local xs n x installs=()
+  if [[ ! -r "$NOTEFILE" ]]; then
+    echo "(${NOTEFILE#$PREFIX/} missing: no installation info)"
+  else
+    note_read_arr xs
+    for ((n=$((${#xs[*]} - 1)); n >= 0; n-- )); do
+      installs+=("${xs[n]}")
+    done
+    for x in "${installs[@]}"; do
+      local name="${x##* }" explicit="${x%% *}"
+      local v="${x%% *}"
+      if [[ "$v" == $DEFAULT_CHANNEL/* ]]; then v="${v#$DEFAULT_CHANNEL/}"; fi
+      show_dir "${x##* }" "($v)"
+    done
+  fi
+  if ! is_seen "$active"; then show_dir "$active" "-"; fi
+  IFS=$'\n' read -rd '' -a xs <<<"$(command ls -t "$PREFIX")" || :
+  for name in "${xs[@]}"; do
+    x="$PREFIX/$name"
+    if [[ -d "$x" && ! -h "$x" && "$name" == node-*-$os_arch \
+       && "$seen" != *$'\n'"$name"$'\n'* ]]; then
+      show_dir "$name" "-"
+    fi
+  done
+}
+
+# -----------------------------------------------------------------------------
+list-remote() {
+  no_args "$@"
+  get_versions
+  echo "$VERSIONS"
+}
+
+# -----------------------------------------------------------------------------
 install() {
-  local v="$1"; shift
+  no_args "$@"
+  get_versions
+  local v="$BEST_VERSION"
   local dirname="node-$v-$os_arch"
-  local oldv="$(note_get "$version")" olddirname
+  local oldv="$(note_get "$CHANNEL/$VERSION")" olddirname
   olddirname="${oldv#* }"; oldv="${oldv%% *}"
   if [[ "$oldv" == "$v" ]]; then oldv=""
-  else note_rm "$version"; fi
+  else note_rm "$CHANNEL/$VERSION"; fi
   #
-  local msg=">>> $version"
-  if [[ "$version" != "$v" ]]; then msg+=" => $v"; fi
+  local msg=">>> $VERCHAIN"
+  if [[ "$VERSION" != "$v" ]]; then msg+=" => $v"; fi
   if [[ -n "$oldv" ]]; then msg+=" (replacing $oldv)"; fi
   echo "$msg"
   # download directory if needed
   if [[ -d "$PREFIX/$dirname" ]]; then
-    echo "* Reusing existing: $dirname"
+    if [[ "$dirname" == "$(readlink "$DIRLINK")" ]]; then
+      echo "* Already using $dirname, nothing to do"
+    else
+      echo "* Reusing existing $dirname"
+    fi
   else
-    local url="$base_url/$v/$dirname.tar.gz"
+    local url="$N_URL/$CHANNEL/$v/$dirname.tar.gz"
     echo "* Downloading $url"
     local tmpdir="$INFODIR/tmp-download"
     rm -rf "$tmpdir"; mkdir "$tmpdir"
@@ -158,54 +534,28 @@ install() {
       rm -rf "$PREFIX/$olddirname"
     fi
   fi
-  note_add "$version" "$v" "$dirname"
+  note_add "$CHANNEL/$VERSION" "$v" "$dirname"
   # reset "node" symlink
-  if [[ -e "$PREFIX/node" && ! -h "$PREFIX/node" ]]; then
-    die "refusing to remove non-symlink: $PREFIX/node"
-  fi
-  rm -f "$PREFIX/node"
-  ln -sf "$dirname" "$PREFIX/node"
+  rm -f "$DIRLINK"
+  ln -sf "$dirname" "$DIRLINK"
   # reset bin/* symlinks
   local b
-  for b in $(ls "$PREFIX/node/bin"); do
-    if [[ -e "$PREFIX/bin/$b" && ! -h "$PREFIX/bin/$b" ]]; then
-      echo "- (ignoring non-symlink $PREFIX/bin/$b)"
+  for b in "$DIRLINK/bin"/*; do
+    b="${b##*/}"
+    if [[ -e "$BINDIR/$b" && ! -h "$BINDIR/$b" ]]; then
+      echo "- (ignoring non-symlink $BINDIR/$b)"
     else
-      ln -sf "../node/bin/$b" "$PREFIX/bin/$b"
+      ln -sf "../node/bin/$b" "$BINDIR/$b"
     fi
   done
+  # remove possibly stale notes
+  note_gc
 }
 
-# ----------------------------------------------------------------------
-run() {
-  local r="$(
-    jq -r "$jq_prolog"'
-      map('"$jq_selector"') | sort_by(version_cmp) | '"$jq_flatten"' | .version
-    ' < "$json")"
-  if [[ -z "$r" ]]; then die "no results"; fi
-  if [[ $mode = ls ]]; then echo "$r"; exit; fi
-  install "${r##*$'\n'}"
-}
+# -----------------------------------------------------------------------------
+# main
 
-# ----------------------------------------------------------------------
-if [[ -z "${1-}" ]]; then die "missing arg"; fi
-mode=download
-while [[ $# -gt 0 ]]; do
-  arg="$1"; shift
-  case "$arg" in
-    ( h | -h | help | --help ) help ;;
-    ( ls | list ) mode="$arg" ;;
-    ( */* ) DSEC="${arg%%/*}"; version="${arg#*/}"; break ;;
-    ( [0-9]*  ) version="v$arg"; break ;;
-    ( v[0-9]* ) version="$arg";  break ;;
-    ( lts     ) version="$arg";  break ;;
-    ( latest | current | cur ) version="cur"; break ;;
-    ( * ) die "unknown argument: $arg" ;;
-  esac
-done
-
-set_os_arch
-set_base_url
-fetch_json
-set_jqcode
-run
+ensure_exes
+set_cmd "$@"
+maybe_sudo "$0" "$@"
+"${CMD[@]}"
